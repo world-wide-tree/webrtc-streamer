@@ -1,108 +1,142 @@
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use opencv::{core::{Mat_, Vector}, imgcodecs::{imencode, imencode_def}, imgproc, prelude::*, videoio};
-use serde::{Deserialize, Serialize};
-use tokio::{sync::mpsc, time::interval};
-use webrtc::{api::{media_engine::MediaEngine, APIBuilder}, ice_transport::ice_candidate::RTCIceCandidateInit, media::Sample, peer_connection::{configuration::RTCConfiguration, sdp::session_description::RTCSessionDescription}, rtp_transceiver::rtp_codec::RTCRtpCodecCapability, track::track_local::track_local_static_sample::TrackLocalStaticSample};
+// use hyper::{Method, Request};
+use lazy_static::lazy_static;
+use opencv::{core::{self, Vector}, highgui::{self, wait_key}, imgcodecs::imencode_def, prelude::*, videoio::{self, VideoCapture}};
+use reqwest::{Body, Client, Request};
+use tokio::sync::{broadcast::channel, mpsc, Mutex};
+use webrtc::{api::{interceptor_registry::register_default_interceptors, media_engine::MediaEngine, APIBuilder}, data_channel::{data_channel_message::DataChannelMessage, RTCDataChannel}, ice_transport::{ice_candidate::RTCIceCandidate, ice_server::RTCIceServer}, interceptor::registry::Registry, peer_connection::{configuration::RTCConfiguration, math_rand_alpha, offer_answer_options::RTCAnswerOptions, peer_connection_state::RTCPeerConnectionState, sdp::session_description::RTCSessionDescription, RTCPeerConnection}};
+
+
+lazy_static! {
+    static ref PEER_CONNECTION_MUTEX: Arc<Mutex<Option<Arc<RTCPeerConnection>>>> =
+        Arc::new(Mutex::new(None));
+    static ref PENDING_CANDIDATES: Arc<Mutex<Vec<RTCIceCandidate>>> = Arc::new(Mutex::new(vec![]));
+    static ref ADDRESS: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+}
+
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut media_engine = MediaEngine::default();
-    media_engine.register_default_codecs()?;
+async fn main() -> Result<(), Box<dyn std::error::Error>>{
+    let clnt = Client::new();
 
-    let api = APIBuilder::new()
-        .with_media_engine(media_engine)
-        .build()
-    ;
-
-    // Конфигурация PeerConnection
-    let config = RTCConfiguration::default();
-    let peer_connection = Arc::new(api.new_peer_connection(config).await?);
-
-    // Создание видеотрека
-    let video_track = Arc::new(TrackLocalStaticSample::new(
-        RTCRtpCodecCapability {
-            mime_type: "video/vp8".to_owned(),
-            ..Default::default()
-        },
-        "video".to_owned(),
-        "webrtc-rs".to_owned(),
-    ));
-    peer_connection.add_track(video_track.clone()).await?;
-
-    // Настройка канала для передачи кадров
-    let (tx, mut rx) = mpsc::channel(100);
+    let (ts, mut tr) = channel(100);
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     tokio::spawn(async move {
-        // Захват видео с камеры
-        let mut cam = videoio::VideoCapture::new(0, videoio::CAP_ANY).unwrap();
-        let opened = videoio::VideoCapture::is_opened(&cam).unwrap();
-        if !opened {
-            panic!("Unable to open default camera!");
-        }
+        let mut cap = VideoCapture::new_def(0).unwrap();
+        loop {
+            let mut frm = Mat::default();
 
-        let mut frame = Mat::default();
-        while videoio::VideoCapture::read(&mut cam, &mut frame).unwrap() {
-            if frame.empty() {
+            if let Err(e) = cap.read(&mut frm){
+                eprintln!("Cannot read frame!");
                 continue;
             }
-            // Преобразование кадра в формат, подходящий для передачи
-            let mut yuv_frame = Mat::default();
-            imgproc::cvt_color(&frame, &mut yuv_frame, imgproc::COLOR_BGR2YUV_I420, 0).unwrap();
-
-            let sample_data = yuv_frame.data_bytes().unwrap().to_vec();
             
-            let sample = Sample{
-                data: Bytes::from(sample_data),
-                duration: Duration::from_secs(1) / 30, //30 fps
-                ..Default::default()
-            };
-            if let Err(e) = tx.try_send(sample){
-                eprintln!("Error: {e}");
+            if let Err(e) = highgui::imshow("winname", &frm){
+                eprintln!("Cannot show frame!");
+                continue;
+            }
+            if let Err(e) = wait_key(1){
+                eprintln!("Cannot wait key!");
+                continue;
+            }
+
+            let mut buf = Vector::new();
+            if let Err(e) = imencode_def(".jpg", &frm, &mut buf){
+                continue;
+            }
+            if let Err(e) = ts.send(buf){
+                
             }
         }
     });
-    tokio::spawn(async move {
-        // Настройка сигнального сервера
-        let client = reqwest::Client::new();
-        let mut interval = interval(Duration::from_secs(1));
 
-        loop {
-            interval.tick().await;
+    // WebRTC connection setting up
+    let config = RTCConfiguration{
+        ice_servers: vec![RTCIceServer {
+            urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut media = MediaEngine::default();
+    media.register_default_codecs()?;
 
-            let sdp = peer_connection.local_description().await.unwrap();
-            let message = SignalMessage {
-                sdp: Some(sdp),
-                candidate: None,
-            };
+    let mut registry = Registry::new();
+    registry = register_default_interceptors(registry, &mut media)?;
 
-            let response = client.post("http://0.0.0.0:3030/signal")
-                .json(&message)
-                .send()
-                .await.unwrap()
-                .json::<SignalMessage>()
-                .await.unwrap();
 
-            if let Some(remote_sdp) = response.sdp {
-                peer_connection.set_remote_description(remote_sdp).await.unwrap();
-            }
+    // Create the API object with the MediaEngine
+    let api = APIBuilder::new()
+        .with_media_engine(media)
+        .with_interceptor_registry(registry)
+        .build();
 
-            if let Some(candidate) = response.candidate {
-                peer_connection.add_ice_candidate(candidate).await.unwrap();
+    let peer_connection = api.new_peer_connection(config).await?;
+
+    peer_connection.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+        println!("Peer Connection State has changed: {s}");
+
+        if s == RTCPeerConnectionState::Failed {
+            // Wait until PeerConnection has had no network activity for 30 seconds or another failure. It may be reconnected using an ICE Restart.
+            // Use webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster timeout.
+            // Note that the PeerConnection may come back from PeerConnectionStateDisconnected.
+            println!("Peer Connection has gone to failed exiting");
+            let _ = done_tx.try_send(());
+        }
+
+        Box::pin(async {})
+    }));
+    println!("safdsdf");
+    let offer = loop {
+        let r = clnt.get("http://0.0.0.0:3030/signal/0").send().await?;
+        if r.status().is_success(){
+            let sdp: RTCSessionDescription = r.json().await?;
+            break sdp;
+        } else {
+            println!("1");
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+
+    peer_connection.set_remote_description(offer).await?;
+    // Create Answer
+    let answer = peer_connection.create_answer(None).await?;
+    println!("safdsdf");
+
+    // Sent SDP to SignalService
+    let r = clnt.post("http://0.0.0.0:3030/answer/0").body(serde_json::to_string(&answer)?).send().await?;
+
+
+    peer_connection.set_local_description(answer).await?;
+
+    let dc = peer_connection.create_data_channel("VideoStreamer", None).await?;
+
+    loop {
+        if let Ok(frm_buf) = tr.try_recv(){
+            let data = Bytes::from(frm_buf.to_vec());
+            if let Err(e) = dc.send(&data).await{
+                println!("{e}");
             }
         }
-    });
-    // Обработка кадров и отправка их в видеотрек
-    while let Some(sample) = rx.recv().await {
-        video_track.write_sample(&sample).await.unwrap();
+
     }
+    tokio::select! {
+        _ = done_rx.recv() => {
+            println!("received done signal!");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            println!();
+        }
+    };
+    peer_connection.close().await?;
 
-    println!("Hello, world!");
     Ok(())
+    
 }
-#[derive(Serialize, Deserialize, Clone)]
-struct SignalMessage {
-    sdp: Option<RTCSessionDescription>,
-    candidate: Option<RTCIceCandidateInit>,
-}
+
+
+
