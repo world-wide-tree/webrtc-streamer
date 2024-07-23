@@ -42,7 +42,7 @@ pub enum Cmd{
     NotSupported
 }
 static WEBSOCKET_URL: &str = "ws://0.0.0.0:3030/device/signaling";
-static ADD_CAMERA_URL: &str = "http://0.0.0.0:3030/device/add/camera";
+static ADD_CAMERA_URL: &str = "http://0.0.0.0:3030/device/add_camera";
 static ANSWER_URL: &str = "http://0.0.0.0:3030/device/answer";
 static CANDIDATE_URL: &str = "http://0.0.0.0:3030/device/candidate";
 static DEVICE_ID: &str = "DefaultDeviceId";
@@ -51,21 +51,25 @@ async fn signal_candidate(ice: DeviceIceDto, user_id: String){
     let msg = Cmd::CandidateFromDevice(ice);
     let response = Client::default()
         .post(format!("{}/{}", CANDIDATE_URL, user_id))
+        .header("content-type", "application/json; charset=utf-8")
         .json(&msg)
         .send()
         .await
         .unwrap()
     ;
+    println!("Signaled candidate to Server: {}", response.text().await.unwrap());
 }
 async fn signal_answer(sdp: DeviceAnswerDto, user_id: String){
     let msg = Cmd::AnswerToUser(sdp);
     let response = Client::default()
         .post(format!("{}/{}", ANSWER_URL, user_id))
+        .header("content-type", "application/json; charset=utf-8")
         .json(&msg)
         .send()
         .await
         .unwrap()
     ;
+    println!("Signaled answer to Server: {}", response.text().await.unwrap());
 }
 async fn add_camera(camera_id: String) {
     let response = Client::default()
@@ -74,6 +78,7 @@ async fn add_camera(camera_id: String) {
         .await
         .unwrap()
     ;
+    println!("Added camera to Server: {}", response.text().await.unwrap());
 }
 struct AppState{
     pub pcs: HashMap<String, Arc<RTCPeerConnection>>,
@@ -240,6 +245,7 @@ async fn create_pc_from_offer(
             }
         })
     }));
+    println!("offer: {offer:#?}");
     peer_connection.set_remote_description(offer).await?;
     let answer = peer_connection.create_answer(None).await?;
     let mut gather_complete = peer_connection.gathering_complete_promise().await;
