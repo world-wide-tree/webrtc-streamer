@@ -1,5 +1,6 @@
 use std::{collections::{HashMap, HashSet}, sync::Arc, time::Duration};
 
+use anyhow::Result;
 use futures::StreamExt;
 use opencv::{
     core::{Mat, Vector}, highgui, imgcodecs, prelude::*, videoio::{self, VideoCapture}
@@ -8,30 +9,32 @@ use reqwest::Client;
 use reqwest_websocket::RequestBuilderExt;
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncWriteExt, net::{TcpListener, TcpStream}, signal, sync::{mpsc::{channel, Receiver, Sender}, Mutex, OnceCell}, task::JoinHandle};
-use webrtc::{api::{interceptor_registry::register_default_interceptors, media_engine::{MediaEngine, MIME_TYPE_VP8}, APIBuilder}, ice_transport::{ice_candidate::{RTCIceCandidate, RTCIceCandidateInit}, ice_connection_state::RTCIceConnectionState, ice_server::RTCIceServer}, interceptor::registry::Registry, peer_connection::{configuration::RTCConfiguration, peer_connection_state::RTCPeerConnectionState, sdp::session_description::RTCSessionDescription, RTCPeerConnection}, rtp_transceiver::rtp_codec::RTCRtpCodecCapability, track::track_local::{track_local_static_rtp::TrackLocalStaticRTP, TrackLocal}};
+use webrtc::{api::{interceptor_registry::register_default_interceptors, media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_VP8}, APIBuilder}, ice_transport::{ice_candidate::{RTCIceCandidate, RTCIceCandidateInit}, ice_connection_state::RTCIceConnectionState, ice_server::RTCIceServer}, interceptor::registry::Registry, peer_connection::{configuration::RTCConfiguration, peer_connection_state::RTCPeerConnectionState, sdp::session_description::RTCSessionDescription, RTCPeerConnection}, rtp_transceiver::rtp_codec::RTCRtpCodecCapability, track::track_local::{track_local_static_rtp::TrackLocalStaticRTP, TrackLocal}};
 use webrtc::track::track_local::TrackLocalWriter;
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserIceDto{
     user_id: String,
-    ice: RTCIceCandidate
+    ice: String
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeviceIceDto{
     device_id: String,
     camera_id: String,
-    ice: RTCIceCandidate
+    ice: String
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeviceOfferDto{
     user_id: String,
     camera_id: String,
-    offer: RTCSessionDescription
+    offer: String
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeviceAnswerDto{
     device_id: String,
     camera_id: String,
-    answer: RTCSessionDescription
+    answer: String
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Cmd{
@@ -48,7 +51,8 @@ static CANDIDATE_URL: &str = "http://0.0.0.0:3030/device/candidate";
 static DEVICE_ID: &str = "DefaultDeviceId";
 
 async fn signal_candidate(ice: DeviceIceDto, user_id: String){
-    let msg = Cmd::CandidateFromDevice(ice);
+    let msg = ice;
+    println!("{:#?}", serde_json::to_string(&msg).unwrap());
     let response = Client::default()
         .post(format!("{}/{}", CANDIDATE_URL, user_id))
         .header("content-type", "application/json; charset=utf-8")
@@ -60,7 +64,7 @@ async fn signal_candidate(ice: DeviceIceDto, user_id: String){
     println!("Signaled candidate to Server: {}", response.text().await.unwrap());
 }
 async fn signal_answer(sdp: DeviceAnswerDto, user_id: String){
-    let msg = Cmd::AnswerToUser(sdp);
+    let msg = sdp;
     let response = Client::default()
         .post(format!("{}/{}", ANSWER_URL, user_id))
         .header("content-type", "application/json; charset=utf-8")
@@ -96,7 +100,7 @@ impl AppState{
 }
 static PC: OnceCell<Arc<Mutex<AppState>>> = OnceCell::const_new();
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     // Init camera proccess
     let mut state = AppState::new();
     state.cameras.insert("0".to_string());
@@ -106,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (sub_ss, sub_rr) = channel(20);
     let stream_handler = streaming_camera_task(sub_rr).await;
     if stream_handler.is_finished() {
-        return stream_handler.await?.map_err(|e|e.into());
+        return Ok(());
     }
 
     let response = Client::default()
@@ -131,7 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Err(e) = sub_ss.try_send(frm_s){
     
                             } else {
-                                let pc = create_pc_from_offer(offer.offer, frm_r, offer.camera_id, offer.user_id.clone()).await?;
+                                let desc_data = decode(offer.offer.as_str())?;
+                                let offer_sdp = serde_json::from_str::<RTCSessionDescription>(&desc_data)?;
+                                let pc = create_pc_from_offer(offer_sdp, frm_r, offer.camera_id, offer.user_id.clone()).await?;
                                 let mut _pc = PC.get().unwrap().lock().await;
                                 _pc.pcs.insert(offer.user_id, pc);
                             }
@@ -140,8 +146,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Cmd::CandidateFromUser(ice) => {
                         let state = PC.get().unwrap().lock().await;
                         if let Some(pc) = state.pcs.get(&ice.user_id){
+                            // let ice = decode(ice.ice.as_str()).unwrap();
+                            
                             pc.add_ice_candidate(RTCIceCandidateInit{
-                                candidate: ice.ice.to_string(),
+                                candidate: ice.ice,
                                 ..Default::default()
                             }).await?;
                         }
@@ -164,7 +172,7 @@ async fn create_pc_from_offer(
     mut frm_r: Receiver<Vector<u8>>, 
     camera_id: String,
     user_id: String,
-) -> std::result::Result<Arc<RTCPeerConnection>, Box<dyn std::error::Error>>{
+) -> Result<Arc<RTCPeerConnection>>{
     let mut m = MediaEngine::default();
     m.register_default_codecs().unwrap();
     let mut registry = Registry::new();
@@ -193,7 +201,7 @@ async fn create_pc_from_offer(
     // Create Track that we send video back to browser on
     let video_track = Arc::new(TrackLocalStaticRTP::new(
         RTCRtpCodecCapability {
-            mime_type: MIME_TYPE_VP8.to_owned(),
+            mime_type: MIME_TYPE_H264.to_owned(),
             ..Default::default()
         },
         "video".to_owned(),
@@ -236,16 +244,17 @@ async fn create_pc_from_offer(
         let camera_id2 = camera_id1.clone();
         Box::pin(async move {
             if let Some(c) = c{
+                let payload = c.to_json().unwrap().candidate;
                 let ice = DeviceIceDto { 
                     device_id: DEVICE_ID.to_string(), 
                     camera_id: camera_id2, 
-                    ice: c,
+                    ice: payload,
                 };
                 signal_candidate(ice, user_id2).await;
             }
         })
     }));
-    println!("offer: {offer:#?}");
+    // println!("offer: {offer:#?}");
     peer_connection.set_remote_description(offer).await?;
     let answer = peer_connection.create_answer(None).await?;
     let mut gather_complete = peer_connection.gathering_complete_promise().await;
@@ -253,8 +262,10 @@ async fn create_pc_from_offer(
     let _ = gather_complete.recv().await;
 
     if let Some(local_desc) = peer_connection.local_description().await{
+        let json_str = serde_json::to_string(&local_desc)?;
+        let b64 = encode(&json_str);
         let answer_dto = DeviceAnswerDto{
-            answer: local_desc,
+            answer: b64,
             device_id: DEVICE_ID.to_string(),
             camera_id
         };
@@ -263,17 +274,27 @@ async fn create_pc_from_offer(
     }
     let done_tx3 = done_tx.clone();
     tokio::spawn(async move {
-        while let Some(n) = frm_r.recv().await{
-            if let Err(e) = video_track.write(n.as_slice()).await{
-                if webrtc::Error::ErrClosedPipe == e {
-                    // The peerConnection has been closed.
-                } else {
-                    println!("video_track write err: {e}");
+        loop{
+            if let Ok(n) = frm_r.try_recv(){
+                let n = n.to_vec();
+                println!("{}", n.len());
+                if let Err(e) = video_track.write(n.as_ref()).await{
+                    if webrtc::Error::ErrClosedPipe == e {
+                        // The peerConnection has been closed.
+                        println!{"Video Track stoped"};
+                        let _ = done_tx3.try_send(());
+                        break;
+                    } else {
+                        println!("video_track write err: {e}");
+                    }
+                    continue;
                 }
-                let _ = done_tx3.try_send(());
-                return;
+                println!{"Sended frm"};
             }
+            tokio::time::sleep(Duration::from_millis(30)).await;
         }
+        println!{"Video Track stoped"};
+
     });
 
     Ok(peer_connection)
@@ -362,8 +383,8 @@ async fn streaming_camera_task(mut subscribe: Receiver<Sender<Vector<u8>>>) -> J
             //         subscriber.
             //     }
             // });
-            // highgui::imshow("ServerWindow", &frame).map_err(|e| e.to_string())?;
-            // highgui::wait_key(1).map_err(|e| e.to_string())?;
+            highgui::imshow("ServerWindow", &frame).map_err(|e| e.to_string())?;
+            highgui::wait_key(1).map_err(|e| e.to_string())?;
             tokio::time::sleep(Duration::from_millis(30)).await;
             // tokio::select! {
             //     _ = signal::ctrl_c() => {
@@ -374,4 +395,35 @@ async fn streaming_camera_task(mut subscribe: Receiver<Sender<Vector<u8>>>) -> J
         Ok(())
     });
     h
+}
+
+#[allow(clippy::assigning_clones)]
+pub fn must_read_stdin() -> Result<String> {
+    let mut line = String::new();
+
+    std::io::stdin().read_line(&mut line)?;
+    line = line.trim().to_owned();
+    println!();
+
+    Ok(line)
+}
+pub fn encode(b: &str) -> String {
+    //if COMPRESS {
+    //    b = zip(b)
+    //}
+
+    BASE64_STANDARD.encode(b)
+}
+
+/// decode decodes the input from base64
+/// It can optionally unzip the input after decoding
+pub fn decode(s: &str) -> Result<String> {
+    let b = BASE64_STANDARD.decode(s)?;
+
+    //if COMPRESS {
+    //    b = unzip(b)
+    //}
+
+    let s = String::from_utf8(b)?;
+    Ok(s)
 }
